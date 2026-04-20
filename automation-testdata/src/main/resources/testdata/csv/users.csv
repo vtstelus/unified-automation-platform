@@ -1,0 +1,4 @@
+userId,username,email,role
+1,john.doe,john@example.com,admin
+2,jane.doe,jane@example.com,user
+3,test.user,test@example.com,qa

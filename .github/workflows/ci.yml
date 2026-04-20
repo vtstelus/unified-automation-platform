@@ -1,0 +1,170 @@
+name: Unified Automation Platform — CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+
+jobs:
+
+  # ── Real change-impact detection ──────────────────────────────────
+  change-analysis:
+    runs-on: ubuntu-latest
+    outputs:
+      run_ui:     ${{ steps.detect.outputs.run_ui }}
+      run_api:    ${{ steps.detect.outputs.run_api }}
+      run_mobile: ${{ steps.detect.outputs.run_mobile }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - name: Detect changed modules
+        id: detect
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          echo "Changed files: $CHANGED"
+
+          # Real detection — only true if the module actually changed
+          if echo "$CHANGED" | grep -qE '^automation-(ui|core)/'; then
+            echo "run_ui=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_ui=false" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED" | grep -qE '^automation-(api|core)/'; then
+            echo "run_api=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_api=false" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED" | grep -qE '^automation-(mobile|core)/'; then
+            echo "run_mobile=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_mobile=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Always run smoke on main branch push
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "run_ui=true" >> $GITHUB_OUTPUT
+            echo "run_api=true" >> $GITHUB_OUTPUT
+            echo "run_mobile=true" >> $GITHUB_OUTPUT
+          fi
+
+  # ── UI Tests — matrix across browsers ─────────────────────────────
+  ui-tests:
+    needs: change-analysis
+    if: needs.change-analysis.outputs.run_ui == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        browser: [chrome, firefox]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '17', distribution: 'temurin' }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+      - name: Run UI Tests — ${{ matrix.browser }}
+        run: |
+          mvn test -pl automation-tests \
+            -Dsurefire.suiteXmlFiles=src/test/resources/testng/testng-smoke.xml \
+            -Dbrowser=${{ matrix.browser }} \
+            -Dheadless=true \
+            -Denv=${{ github.event.inputs.env || 'dev' }} \
+            -Dgroups=ui,smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-report-${{ matrix.browser }}
+          path: automation-tests/target/reports/
+
+  # ── API Tests ──────────────────────────────────────────────────────
+  api-tests:
+    needs: change-analysis
+    if: needs.change-analysis.outputs.run_api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '17', distribution: 'temurin' }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+      - name: Run API Tests
+        run: |
+          mvn test -pl automation-tests \
+            -Dsurefire.suiteXmlFiles=src/test/resources/testng/testng-suite.xml \
+            -Denv=${{ github.event.inputs.env || 'dev' }} \
+            -Dgroups=api
+        env:
+          API_AUTH_TOKEN: ${{ secrets.API_AUTH_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-report
+          path: automation-tests/target/reports/
+
+  # ── Mobile Tests — BrowserStack matrix ────────────────────────────
+  mobile-tests:
+    needs: change-analysis
+    if: needs.change-analysis.outputs.run_mobile == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [android, ios]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '17', distribution: 'temurin' }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+      - name: Run Mobile Tests — ${{ matrix.platform }}
+        run: |
+          mvn test -pl automation-tests \
+            -Dsurefire.suiteXmlFiles=src/test/resources/testng/testng-suite.xml \
+            -Dplatform=${{ matrix.platform }} \
+            -Ddriver.mode=browserstack \
+            -Denv=${{ github.event.inputs.env || 'dev' }} \
+            -Dgroups=mobile
+        env:
+          BS_USER: ${{ secrets.BS_USER }}
+          BS_KEY:  ${{ secrets.BS_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-report-${{ matrix.platform }}
+          path: automation-tests/target/reports/
+
+  # ── Publish JAR to GitHub Packages (main only) ─────────────────────
+  publish:
+    needs: [ui-tests, api-tests, mobile-tests]
+    if: github.ref == 'refs/heads/main' && success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+      - name: Publish to GitHub Packages
+        run: mvn --batch-mode deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
